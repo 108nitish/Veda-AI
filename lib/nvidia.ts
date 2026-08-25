@@ -9,6 +9,52 @@ export const VISION_MODELS = [
   "nvidia/llama-3.1-nemotron-nano-vl-8b-v1", // efficient fallback
 ] as const;
 
+export async function extractTextProfessional(
+  images: string[],
+  kind: "question" | "answer",
+) {
+  if (kind === "question") {
+    const { questions, model } = await extractQuestionsStructured(images);
+    const extractedText = questions
+      .map((q) => `${q.label}. ${q.text} ${q.marks ? `(${q.marks} marks)` : ""}`)
+      .join("\n\n");
+    return { extractedText, model };
+  } else {
+    const { blocks, model } = await extractAnswerBlocksStructured(images);
+    const extractedText = blocks
+      .map((b) => (b.label ? `Q${b.label}: ${b.text}` : b.text))
+      .join("\n\n");
+    return { extractedText, model };
+  }
+}
+
+export async function gradeWithLLM(
+  questionText: string,
+  answerText: string,
+) {
+  const questions = questionText
+    .split("\n\n")
+    .filter((q) => q.trim())
+    .map((q, i) => ({
+      id: i + 1,
+      label: String(i + 1),
+      text: q.trim(),
+      marks: null,
+    }));
+
+  const blocks = answerText
+    .split("\n\n")
+    .filter((a) => a.trim())
+    .map((a, i) => ({
+      id: i + 1,
+      page: 1,
+      label: String(i + 1),
+      text: a.trim(),
+    }));
+
+  return mapAndGrade(questions, blocks);
+}
+
 // Best FREE text models verified
 export const TEXT_MODELS = [
   "meta/llama-3.3-70b-instruct", // best grading reasoning, free
