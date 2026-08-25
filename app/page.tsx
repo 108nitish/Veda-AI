@@ -1,6 +1,6 @@
 "use client";
 
-import { useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import Image from "next/image";
 import { fileToDataUrls } from "@/lib/fileUtils";
 
@@ -8,26 +8,66 @@ type FileKind = "question" | "answer";
 
 const navItems = ["Home", "My Classroom", "Assignments", "Exams", "My Library"];
 
-type GradedQuestion = {
+type Question = {
   id: number;
-  question: string;
-  maxMarks: number;
+  label: string;
+  text: string;
+  marks: number | null;
+  page: number;
+};
+
+type AnswerBlock = {
+  id: number;
+  page: number;
+  label: string | null;
+  text: string;
+  bbox: { x: number; y: number; w: number; h: number };
+};
+
+type MappingResult = {
+  questionId: number;
+  blockIds: number[];
   awarded: number;
+  maxMarks: number;
   tone: "good" | "warn" | "bad";
   feedback: string;
-  answerExcerpt: string;
   confidence: number;
 };
 
-type Evaluation = {
+type GradedQuestion = Question & MappingResult;
+
+type EvaluationResult = {
   questions: GradedQuestion[];
-  questionPaperText: string;
-  answerSheetText: string;
+  blocks: AnswerBlock[];
+  unmatchedBlockIds: number[];
   totalAwarded: number;
   totalMax: number;
   overallFeedback: string;
-  visionModels: { question: string; answer: string };
-  model: string;
+};
+
+type Step =
+  | "idle"
+  | "reading-files"
+  | "reading-questions"
+  | "reading-answers"
+  | "mapping"
+  | "done";
+
+const STEP_ORDER: Step[] = [
+  "reading-files",
+  "reading-questions",
+  "reading-answers",
+  "mapping",
+  "done",
+];
+
+const STEP_LABELS: Record<Step, string> = {
+  idle: "Idle",
+  "reading-files": "Reading uploaded files",
+  "reading-questions": "Extracting questions from paper",
+  "reading-answers": "Reading handwritten answers",
+  mapping: "Mapping answers to questions & grading",
+  done: "Done",
 };
 
 function Icon({ children }: { children: React.ReactNode }) {
@@ -204,6 +244,26 @@ function FileCard({
   );
 }
 
+function ProgressSteps({ step }: { step: Step }) {
+  const activeIdx = STEP_ORDER.indexOf(step);
+  return (
+    <div className="progress-steps" role="status" aria-live="polite">
+      {STEP_ORDER.slice(0, 4).map((s, i) => {
+        const state =
+          i < activeIdx ? "done" : i === activeIdx ? "active" : "pending";
+        return (
+          <div key={s} className={`progress-step ${state}`}>
+            <span className="progress-dot">
+              {state === "done" ? "✓" : i + 1}
+            </span>
+            <span className="progress-label">{STEP_LABELS[s]}</span>
+          </div>
+        );
+      })}
+    </div>
+  );
+}
+
 function UploadView({
   questionFile,
   answerFile,
@@ -211,6 +271,7 @@ function UploadView({
   onAnswerFile,
   onStart,
   loading,
+  step,
 }: {
   questionFile: File | null;
   answerFile: File | null;
@@ -218,6 +279,7 @@ function UploadView({
   onAnswerFile: (f: File | null) => void;
   onStart: () => void;
   loading: boolean;
+  step: Step;
 }) {
   const ready = !!questionFile && !!answerFile;
   return (
@@ -226,11 +288,7 @@ function UploadView({
         <h1>
           Upload <span>Question Paper &amp; Answer Sheets</span>
         </h1>
-        <p className="hero-subtitle">
-          <span className="hero-subtitle-grey">Upload</span>{" "}
-          <span className="hero-subtitle-orange">
-            Question Paper &amp; Answer Sheet
-          </span>
+        <p className="hero-subtitle"> Upload both files to get started
         </p>
         <div className="teacher-art">
           <Image
@@ -269,12 +327,13 @@ function UploadView({
       {loading && (
         <div className="extracting-card" role="status" aria-live="polite">
           <div className="extracting-spinner" />
-          <div>
-            <strong>Extracting text with NVIDIA vision…</strong>
+          <div style={{ width: "100%" }}>
+            <strong>Extracting with NVIDIA vision models…</strong>
             <p>
               This may take a while — we’re using free high-quality models to
               read your papers professionally.
             </p>
+            <ProgressSteps step={step} />
             <div className="extracting-steps">
               <span>
                 • Vision: nvidia/nemotron-3-nano-omni → nemotron-nano-12b-v2-vl
@@ -293,24 +352,67 @@ function UploadView({
   );
 }
 
+type Selection = { type: "question" | "block"; id: number } | null;
+
 function MappingView({
   data,
   answerImages,
   onBack,
 }: {
-  data: Evaluation;
+  data: EvaluationResult;
   answerImages: string[];
   onBack: () => void;
 }) {
-  const [expanded, setExpanded] = useState<number>(0);
+  const [selection, setSelection] = useState<Selection>(null);
+  const [expanded, setExpanded] = useState<number | null>(null);
+  const pageRefs = useRef<Record<number, HTMLDivElement | null>>({});
+
   const percent = data.totalMax
     ? Math.round((data.totalAwarded / data.totalMax) * 100)
     : 0;
 
+  const blocksById = useMemo(
+    () => new Map(data.blocks.map((b) => [b.id, b])),
+    [data.blocks],
+  );
+
+  const unmatchedBlocks = useMemo(
+    () => data.blocks.filter((b) => data.unmatchedBlockIds.includes(b.id)),
+    [data.blocks, data.unmatchedBlockIds],
+  );
+
+  const highlightedBlockIds = useMemo(() => {
+    if (!selection) return new Set<number>();
+    if (selection.type === "block") return new Set([selection.id]);
+    const q = data.questions.find((q) => q.id === selection.id);
+    return new Set(q?.blockIds ?? []);
+  }, [selection, data.questions]);
+
+  function selectQuestion(q: GradedQuestion) {
+    setExpanded((prev) => (prev === q.id ? null : q.id));
+    if (q.blockIds.length === 0) {
+      setSelection({ type: "question", id: q.id });
+      return;
+    }
+    setSelection({ type: "question", id: q.id });
+    const firstBlock = blocksById.get(q.blockIds[0]);
+    if (firstBlock) {
+      const el = pageRefs.current[firstBlock.page];
+      el?.scrollIntoView({ behavior: "smooth", block: "start" });
+    }
+  }
+
+  function selectBlock(block: AnswerBlock) {
+    setSelection({ type: "block", id: block.id });
+    const el = pageRefs.current[block.page];
+    el?.scrollIntoView({ behavior: "smooth", block: "start" });
+  }
+
+  const pageCount = answerImages.length;
+
   return (
     <section className="mapping-view">
       <div className="questions-panel">
-        {/* SIMPLE SCORE + AI THOUGHT — first iteration as requested */}
         <div className="simple-result">
           <div className="simple-score-card">
             <p className="simple-label">This is your Score</p>
@@ -328,57 +430,96 @@ function MappingView({
         </div>
 
         <div className="question-list" style={{ marginTop: 16 }}>
-          {data.questions.map((q) => (
-            <article
-              className={`question ${expanded === q.id - 1 ? "open" : ""}`}
-              key={q.id}
-            >
-              <button
-                className="question-row"
-                onClick={() =>
-                  setExpanded(expanded === q.id - 1 ? -1 : q.id - 1)
-                }
+          {data.questions.map((q) => {
+            const answered = q.blockIds.length > 0;
+            const isSelected =
+              selection?.type === "question" && selection.id === q.id;
+            return (
+              <article
+                className={`question ${expanded === q.id ? "open" : ""} ${isSelected ? "selected" : ""}`}
+                key={q.id}
               >
-                <b className="number">{q.id}</b>
-                <span className="question-text">{q.question}</span>
-                <strong className={`score ${q.tone}`}>
-                  {q.awarded}/{q.maxMarks}
-                </strong>
-                <span className="chevron">
-                  {expanded === q.id - 1 ? "⌃" : "⌄"}
-                </span>
-              </button>
-              {expanded === q.id - 1 && (
-                <div className="feedback">
-                  <h3>AI Thought for Q{q.id}</h3>
-                  <p>{q.feedback}</p>
-                  {q.answerExcerpt && (
-                    <p
-                      style={{
-                        marginTop: 8,
-                        fontStyle: "italic",
-                        color: "#6b6b6f",
-                      }}
-                    >
-                      Your answer: “{q.answerExcerpt}”
-                    </p>
+                <button className="question-row" onClick={() => selectQuestion(q)}>
+                  <b className="number">{q.label}</b>
+                  <span className="question-text">{q.text}</span>
+                  {answered ? (
+                    <strong className={`score ${q.tone}`}>
+                      {q.awarded}/{q.maxMarks}
+                    </strong>
+                  ) : (
+                    <strong className="score unanswered">Not answered</strong>
                   )}
-                </div>
-              )}
-            </article>
-          ))}
+                  <span className="chevron">
+                    {expanded === q.id ? "⌃" : "⌄"}
+                  </span>
+                </button>
+                {expanded === q.id && (
+                  <div className="feedback">
+                    <h3>AI Thought for {q.label}</h3>
+                    <p>{q.feedback}</p>
+                    {answered ? (
+                      <p
+                        style={{
+                          marginTop: 8,
+                          fontStyle: "italic",
+                          color: "#6b6b6f",
+                        }}
+                      >
+                        Your answer: “
+                        {q.blockIds
+                          .map((id) => blocksById.get(id)?.text ?? "")
+                          .filter(Boolean)
+                          .join(" … ")
+                          .slice(0, 220)}
+                        ”
+                        {q.blockIds.length > 1 && (
+                          <span> (spans {q.blockIds.length} pages)</span>
+                        )}
+                      </p>
+                    ) : (
+                      <p
+                        style={{
+                          marginTop: 8,
+                          color: "#b3391f",
+                          fontWeight: 600,
+                        }}
+                      >
+                        No matching answer was found on the answer sheet.
+                      </p>
+                    )}
+                  </div>
+                )}
+              </article>
+            );
+          })}
         </div>
 
-        <button
-          onClick={onBack}
-          style={{
-            marginTop: 14,
-            padding: "10px 16px",
-            borderRadius: 12,
-            background: "#fff",
-            fontSize: 14,
-          }}
-        >
+        {unmatchedBlocks.length > 0 && (
+          <div className="unmatched-panel">
+            <h3>Answers not matched to any question</h3>
+            <p className="unmatched-hint">
+              These handwritten blocks were found on the answer sheet but
+              didn’t correspond to any printed question.
+            </p>
+            <div className="unmatched-list">
+              {unmatchedBlocks.map((b) => (
+                <button
+                  key={b.id}
+                  className={`unmatched-item ${selection?.type === "block" && selection.id === b.id ? "selected" : ""}`}
+                  onClick={() => selectBlock(b)}
+                >
+                  <span className="unmatched-page">Page {b.page}</span>
+                  {b.label && <span className="unmatched-label">“{b.label}”</span>}
+                  <span className="unmatched-text">
+                    {b.text.slice(0, 90) || "(no legible text)"}
+                  </span>
+                </button>
+              ))}
+            </div>
+          </div>
+        )}
+
+        <button className="upload-again" onClick={onBack}>
           ← Upload again
         </button>
       </div>
@@ -393,34 +534,55 @@ function MappingView({
           </div>
         </div>
         <div className="paper">
-          {answerImages.length ? (
-            <div style={{ padding: 12, display: "grid", gap: 12 }}>
-              {answerImages.map((src, i) => (
-                // eslint-disable-next-line @next/next/no-img-element
-                <img
-                  key={i}
-                  src={src}
-                  alt={`Answer page ${i + 1}`}
-                  style={{
-                    width: "100%",
-                    borderRadius: 12,
-                    background: "#fff",
-                  }}
-                />
-              ))}
+          {pageCount ? (
+            <div style={{ padding: 12, display: "grid", gap: 16 }}>
+              {answerImages.map((src, i) => {
+                const pageNum = i + 1;
+                const pageBlocks = data.blocks.filter(
+                  (b) => b.page === pageNum,
+                );
+                return (
+                  <div
+                    key={i}
+                    ref={(el) => {
+                      pageRefs.current[pageNum] = el;
+                    }}
+                    className="answer-page"
+                  >
+                    <span className="answer-page-label">Page {pageNum}</span>
+                    <div className="answer-page-frame">
+                      {/* eslint-disable-next-line @next/next/no-img-element */}
+                      <img src={src} alt={`Answer page ${pageNum}`} />
+                      {pageBlocks.map((b) => {
+                        const isActive = highlightedBlockIds.has(b.id);
+                        const isUnmatched = data.unmatchedBlockIds.includes(
+                          b.id,
+                        );
+                        return (
+                          <div
+                            key={b.id}
+                            className={`bbox-marker ${isActive ? "active" : ""} ${isUnmatched ? "unmatched" : ""}`}
+                            style={{
+                              left: `${b.bbox.x}%`,
+                              top: `${b.bbox.y}%`,
+                              width: `${b.bbox.w}%`,
+                              height: `${b.bbox.h}%`,
+                            }}
+                          >
+                            {b.label && (
+                              <span className="bbox-tag">{b.label}</span>
+                            )}
+                          </div>
+                        );
+                      })}
+                    </div>
+                  </div>
+                );
+              })}
             </div>
           ) : (
             <div className="paper-content">
-              <pre
-                style={{
-                  whiteSpace: "pre-wrap",
-                  fontFamily: "inherit",
-                  fontSize: 15,
-                  lineHeight: 1.6,
-                }}
-              >
-                {data.answerSheetText}
-              </pre>
+              <p>No answer sheet pages to display.</p>
             </div>
           )}
         </div>
@@ -435,9 +597,10 @@ export default function Page() {
   const [view, setView] = useState<"upload" | "mapping">("upload");
   const [questionFile, setQuestionFile] = useState<File | null>(null);
   const [answerFile, setAnswerFile] = useState<File | null>(null);
-  const [evaluation, setEvaluation] = useState<Evaluation | null>(null);
+  const [evaluation, setEvaluation] = useState<EvaluationResult | null>(null);
   const [answerPreviews, setAnswerPreviews] = useState<string[]>([]);
   const [loading, setLoading] = useState(false);
+  const [step, setStep] = useState<Step>("idle");
   const [error, setError] = useState<string | null>(null);
 
   async function handleStart() {
@@ -445,31 +608,91 @@ export default function Page() {
     setLoading(true);
     setError(null);
     try {
-      console.log(
-        `[VedaAI][CLIENT] Starting conversion: Q=${questionFile.name} (${Math.round(questionFile.size / 1024)}KB), A=${answerFile.name} (${Math.round(answerFile.size / 1024)}KB)`,
-      );
+      setStep("reading-files");
       const [qImgs, aImgs] = await Promise.all([
         fileToDataUrls(questionFile, 12),
         fileToDataUrls(answerFile, 12),
       ]);
-      console.log(
-        `[VedaAI][CLIENT] Converted → Q:${qImgs.length} pages, A:${aImgs.length} pages, calling /api/evaluate...`,
-      );
       setAnswerPreviews(aImgs);
 
-      const res = await fetch("/api/evaluate", {
+      setStep("reading-questions");
+      const qRes = await fetch("/api/extract-questions", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ questionImages: qImgs, answerImages: aImgs }),
+        body: JSON.stringify({ images: qImgs }),
       });
-      const json = await res.json();
-      if (!res.ok) throw new Error(json.error || "Evaluation failed");
-      setEvaluation(json as Evaluation);
+      const qJson = await qRes.json();
+      if (!qRes.ok) throw new Error(qJson.error || "Question extraction failed");
+      const questions: Question[] = qJson.questions;
+      if (!questions.length) {
+        throw new Error(
+          "No questions could be detected in the question paper. Try a clearer scan.",
+        );
+      }
+
+      setStep("reading-answers");
+      const aRes = await fetch("/api/extract-answers", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ images: aImgs }),
+      });
+      const aJson = await aRes.json();
+      if (!aRes.ok) throw new Error(aJson.error || "Answer extraction failed");
+      const blocks: AnswerBlock[] = aJson.blocks;
+
+      setStep("mapping");
+      const mRes = await fetch("/api/map-grade", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          questions: questions.map((q) => ({
+            id: q.id,
+            label: q.label,
+            text: q.text,
+            marks: q.marks,
+          })),
+          blocks: blocks.map((b) => ({
+            id: b.id,
+            page: b.page,
+            label: b.label,
+            text: b.text,
+          })),
+        }),
+      });
+      const mJson = await mRes.json();
+      if (!mRes.ok) throw new Error(mJson.error || "Mapping/grading failed");
+      const results: MappingResult[] = mJson.results;
+
+      const resultByQ = new Map(results.map((r) => [r.questionId, r]));
+      const gradedQuestions: GradedQuestion[] = questions.map((q) => {
+        const r = resultByQ.get(q.id);
+        return {
+          ...q,
+          questionId: q.id,
+          blockIds: r?.blockIds ?? [],
+          awarded: r?.awarded ?? 0,
+          maxMarks: r?.maxMarks ?? q.marks ?? 5,
+          tone: r?.tone ?? "bad",
+          feedback: r?.feedback ?? "No feedback available.",
+          confidence: r?.confidence ?? 0,
+        };
+      });
+
+      setStep("done");
+      setEvaluation({
+        questions: gradedQuestions,
+        blocks,
+        unmatchedBlockIds: mJson.unmatchedBlockIds ?? [],
+        totalAwarded: mJson.totalAwarded ?? 0,
+        totalMax: mJson.totalMax ?? 0,
+        overallFeedback: mJson.overallFeedback ?? "",
+      });
       setView("mapping");
     } catch (e) {
       setError(e instanceof Error ? e.message : "Failed");
     } finally {
       setLoading(false);
+      setStep("idle");
     }
   }
 
@@ -502,6 +725,7 @@ export default function Page() {
             onAnswerFile={setAnswerFile}
             onStart={handleStart}
             loading={loading}
+            step={step}
           />
         ) : evaluation ? (
           <MappingView
